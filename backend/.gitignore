@@ -1,0 +1,54 @@
+# Node.js dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build output
+dist/
+build/
+.cache/
+.tmp/
+
+# Logs
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Coverage
+coverage/
+*.lcov
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
+
+# Misc
+*.tgz
+*.zip
+*.tar
+*.gz
+
+# Optional: ignore lock files if you don’t want them in repo
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
