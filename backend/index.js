@@ -62,4 +62,4 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(5050, () => console.log("✅ Server on 5050"));
+server.listen(process.env.PORT || 5050, () => console.log("✅ Server on 5050"));

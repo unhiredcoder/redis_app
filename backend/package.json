@@ -5,10 +5,11 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
+    "start": "concurrently \"npm run server\" \"npm run worker\"",
+    "dev": "concurrently \"npm run server\" \"npm run worker\"",
     "server": "node index.js",
-    "worker": "node worker.js",
-    "dev": "concurrently \"npm run server\" \"npm run worker\""
-  },
+    "worker": "node worker.js"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
