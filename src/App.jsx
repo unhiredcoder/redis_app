@@ -10,7 +10,7 @@ import {
 import './App.css';
 
 // Connect to your backend server
-const socket = io("http://10.10.15.140:5050");
+const socket = io(import.meta.env.VITE_BACKEND_URL || "http://localhost:5050");
 
 function App() {
   // Mode State
@@ -43,15 +43,23 @@ function App() {
 
   // Initialize socket connection
   useEffect(() => {
-    socket.on("connect", () => {
+if (socket.connected) {
+      setIsConnected(true);
+    }
+
+    const onConnect = () => {
       setIsConnected(true);
       console.log("Connected to server");
-    });
+    };
 
-    socket.on("disconnect", () => {
+    const onDisconnect = () => {
       setIsConnected(false);
       console.log("Disconnected from server");
-    });
+    };
+
+    // Use named functions so they can be cleaned up reliably
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
 
     // Listen for job completion
     socket.on("jobCompleted", (data) => {

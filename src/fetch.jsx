@@ -6,7 +6,7 @@ import {
   X, CheckCircle
 } from "lucide-react";
 
-const socket = io("http://10.10.15.140:5050");
+const socket = io(import.meta.env.VITE_BACKEND_URL || "http://localhost:5050");
 
 export default function FetchEmails() {
   const [mysqlData, setMysqlData] = useState([]);
@@ -46,14 +46,23 @@ export default function FetchEmails() {
 
   // Initialize socket connection
   useEffect(() => {
-    socket.on("connect", () => {
+ if (socket.connected) {
       setIsConnected(true);
-      console.log("Connected to fetch server");
-    });
+    }
 
-    socket.on("disconnect", () => {
+    const onConnect = () => {
+      setIsConnected(true);
+      console.log("Connected to server");
+    };
+
+    const onDisconnect = () => {
       setIsConnected(false);
-    });
+      console.log("Disconnected from server");
+    };
+
+    // Use named functions so they can be cleaned up reliably
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
 
     // Listen for email queued events (real-time updates)
     socket.on("emailQueued", (data) => {

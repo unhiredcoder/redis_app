@@ -1,6 +1,35 @@
 import { Worker } from "bullmq";
-import connection from "./mysql_db.js";
+import pkg from 'pg';
+const { Pool } = pkg;
 import { emailCollection } from "./mongo_db.js";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+// --- PostgreSQL (Supabase) Connection ---
+const pgPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+// Test PostgreSQL connection
+async function testConnection() {
+  try {
+    const client = await pgPool.connect();
+    console.log("✅ Connected to PostgreSQL (Supabase)");
+    client.release();
+  } catch (error) {
+    console.error("❌ PostgreSQL connection error:", error);
+    process.exit(1);
+  }
+}
+
+testConnection();
+
+// Helper function for queries
+const query = (text, params) => pgPool.query(text, params);
 
 const emailWorker = new Worker(
   "emailQueue",
@@ -18,9 +47,9 @@ const emailWorker = new Worker(
         // Update job progress
         await job.updateProgress(10);
 
-        // Check MySQL for duplicate
-        const [existingMySQL] = await connection.query(
-          "SELECT id, email FROM emails WHERE email = ?",
+        // Check PostgreSQL for duplicate
+        const existingMySQL = await query(
+          "SELECT id, email FROM emails WHERE email = $1",
           [email]
         );
         
@@ -33,19 +62,19 @@ const emailWorker = new Worker(
         // Update job progress
         await job.updateProgress(50);
 
-        if (existingMySQL.length > 0 || existingMongoDB) {
+        if (existingMySQL.rows.length > 0 || existingMongoDB) {
           console.log(`⚠️ Duplicate found: ${email}`);
           duplicates.push(email);
           skippedCount = 1;
           
           // Insert into the database where it doesn't exist
-          if (existingMySQL.length === 0) {
-            // Insert into MySQL
-            const [result] = await connection.query(
-              "INSERT INTO emails (email, subject, body, created_at) VALUES (?, ?, ?, NOW())",
+          if (existingMySQL.rows.length === 0) {
+            // Insert into PostgreSQL
+            const result = await query(
+              "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
               [email, subject, body]
             );
-            console.log(`📝 Inserted into MySQL: ${result.insertId}`);
+            console.log(`📝 Inserted into PostgreSQL: ${result.rows[0].id}`);
             insertedCount++;
           }
           
@@ -73,12 +102,12 @@ const emailWorker = new Worker(
           };
         }
 
-        // Insert into MySQL (no duplicate)
-        const [mysqlResult] = await connection.query(
-          "INSERT INTO emails (email, subject, body, created_at) VALUES (?, ?, ?, NOW())",
+        // Insert into PostgreSQL (no duplicate)
+        const pgResult = await query(
+          "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
           [email, subject, body]
         );
-        console.log(`✅ MySQL insert: ${mysqlResult.insertId}`);
+        console.log(`✅ PostgreSQL insert: ${pgResult.rows[0].id}`);
         insertedCount++;
         
         await job.updateProgress(70);
@@ -117,9 +146,10 @@ const emailWorker = new Worker(
         // Extract email addresses
         const emailList = emails.map(e => e.email);
         
-        // Check MySQL for existing emails
-        const [existingMySQL] = await connection.query(
-          "SELECT email FROM emails WHERE email IN (?)",
+        // Check PostgreSQL for existing emails
+        // PostgreSQL doesn't support IN with array directly, so we use ANY($1)
+        const existingPostgreSQL = await query(
+          "SELECT email FROM emails WHERE email = ANY($1::text[])",
           [emailList]
         );
         
@@ -132,9 +162,9 @@ const emailWorker = new Worker(
         
         await job.updateProgress(50);
 
-        const existingEmailsMySQL = new Set(existingMySQL.map(e => e.email));
+        const existingEmailsPostgreSQL = new Set(existingPostgreSQL.rows.map(e => e.email));
         const existingEmailsMongoDB = new Set(existingMongoDB.map(e => e.email));
-        const allExistingEmails = new Set([...existingEmailsMySQL, ...existingEmailsMongoDB]);
+        const allExistingEmails = new Set([...existingEmailsPostgreSQL, ...existingEmailsMongoDB]);
 
         // Separate unique and duplicate emails
         const uniqueEmails = emails.filter(emailObj => !allExistingEmails.has(emailObj.email));
@@ -145,22 +175,39 @@ const emailWorker = new Worker(
 
         console.log(`📊 Unique: ${uniqueEmails.length}, Duplicates: ${duplicates.length}`);
 
-        // Process unique emails for MySQL
+        // Process unique emails for PostgreSQL
         if (uniqueEmails.length > 0) {
-          const mysqlValues = uniqueEmails.map(email => [
-            email.email,
-            email.subject,
-            email.body,
-            new Date()
-          ]);
+          // PostgreSQL bulk insert using multiple VALUES rows
+          let insertedRows = 0;
           
-          const [mysqlResult] = await connection.query(
-            "INSERT INTO emails (email, subject, body, created_at) VALUES ?",
-            [mysqlValues]
-          );
+          // Process in batches to avoid huge queries
+          const batchSize = 100;
+          for (let i = 0; i < uniqueEmails.length; i += batchSize) {
+            const batch = uniqueEmails.slice(i, i + batchSize);
+            
+            // Build parameterized query for batch
+            const values = [];
+            const placeholders = [];
+            
+            batch.forEach((email, index) => {
+              const baseIndex = index * 3;
+              placeholders.push(`($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, NOW())`);
+              values.push(email.email, email.subject, email.body);
+            });
+            
+            const batchQuery = `
+              INSERT INTO emails (email, subject, body, created_at) 
+              VALUES ${placeholders.join(', ')}
+              RETURNING id
+            `;
+            
+            const result = await query(batchQuery, values);
+            insertedRows += result.rowCount;
+            console.log(`✅ PostgreSQL batch insert: ${result.rowCount} rows`);
+          }
           
-          console.log(`✅ MySQL bulk insert: ${mysqlResult.affectedRows} rows`);
-          insertedCount += mysqlResult.affectedRows;
+          console.log(`✅ PostgreSQL bulk insert: ${insertedRows} rows total`);
+          insertedCount += insertedRows;
         }
         
         await job.updateProgress(70);
@@ -181,13 +228,13 @@ const emailWorker = new Worker(
           insertedCount += mongoResult.insertedCount;
         }
 
-        // Handle emails that exist only in MySQL (add to MongoDB)
-        const emailsOnlyInMySQL = duplicateEmails.filter(emailObj => 
-          existingEmailsMySQL.has(emailObj.email) && !existingEmailsMongoDB.has(emailObj.email)
+        // Handle emails that exist only in PostgreSQL (add to MongoDB)
+        const emailsOnlyInPostgreSQL = duplicateEmails.filter(emailObj => 
+          existingEmailsPostgreSQL.has(emailObj.email) && !existingEmailsMongoDB.has(emailObj.email)
         );
         
-        if (emailsOnlyInMySQL.length > 0) {
-          const mongoDocs = emailsOnlyInMySQL.map(email => ({
+        if (emailsOnlyInPostgreSQL.length > 0) {
+          const mongoDocs = emailsOnlyInPostgreSQL.map(email => ({
             email: email.email,
             subject: email.subject,
             body: email.body,
@@ -195,7 +242,7 @@ const emailWorker = new Worker(
           }));
           
           const mongoResult = await emailCollection.insertMany(mongoDocs);
-          console.log(`📝 Added ${mongoResult.insertedCount} emails to MongoDB (existed only in MySQL)`);
+          console.log(`📝 Added ${mongoResult.insertedCount} emails to MongoDB (existed only in PostgreSQL)`);
           insertedCount += mongoResult.insertedCount;
         }
         
@@ -218,8 +265,7 @@ const emailWorker = new Worker(
   },
   {
     connection: {
-      host: "10.10.15.140",
-      port: 6379,
+        url: process.env.REDIS_URL
     },
     concurrency: 5,
     removeOnComplete: {
@@ -247,6 +293,19 @@ emailWorker.on("progress", (job, progress) => {
 
 emailWorker.on("error", (err) => {
   console.error("Worker error:", err);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Received SIGINT. Closing PostgreSQL pool...');
+  await pgPool.end();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM. Closing PostgreSQL pool...');
+  await pgPool.end();
+  process.exit(0);
 });
 
 console.log("✅ Email worker started and waiting for jobs...");

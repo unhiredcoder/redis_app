@@ -5,7 +5,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "nodemon index.js"
+    "server": "node index.js",
+    "worker": "node worker.js",
+    "dev": "concurrently \"npm run server\" \"npm run worker\""
   },
   "keywords": [],
   "author": "",
@@ -14,6 +16,7 @@
     "axios": "^1.13.2",
     "bullmq": "^5.65.1",
     "cheerio": "^1.1.2",
+    "concurrently": "^9.2.1",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",
     "dotenv": "^17.2.3",
@@ -23,6 +26,7 @@
     "multer": "^2.0.2",
     "mysql2": "^3.15.3",
     "nodemon": "^3.1.11",
+    "pg": "^8.19.0",
     "socket.io": "^4.8.1"
   }
 }
