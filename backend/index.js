@@ -7,6 +7,7 @@ import pkg from 'pg';
 const { Pool } = pkg;
 import { emailCollection } from "./mongo_db.js";
 import dotenv from "dotenv";
+import redis from "./redis_client.js";
 
 dotenv.config();
 
@@ -21,6 +22,27 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+app.get("/health", async (req, res) => {
+  try {
+    await Promise.all([
+      pgPool.query("SELECT 1"),
+      redis.ping(),
+    ]);
+
+    res.status(200).json({
+      status: "All services are healthy"
+    });
+
+  } catch (err) {
+    console.error("Health check failed:", err);
+
+    res.status(500).json({
+      status: "unhealthy",
+      error: err.message
+    });
+  }
+});
 
 io.on("connection", (socket) => {
   // Handle requests for "MySQL" (Postgres) data from frontend
