@@ -34,6 +34,8 @@ app.get("/health", async (req, res) => {
       status: "All services are healthy"
     });
 
+  console.log('🏥 Health check pinged at:', new Date().toISOString());
+
   } catch (err) {
     console.error("Health check failed:", err);
 
