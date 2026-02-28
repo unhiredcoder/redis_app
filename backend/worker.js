@@ -12,7 +12,7 @@ const pgPool = new Pool({
   ssl: {
     rejectUnauthorized: false
   },
-  max: 10, // Limit connection pool size
+  max: 10,
   idleTimeoutMillis: 30000
 });
 
@@ -30,13 +30,13 @@ async function testConnection() {
 
 testConnection();
 
-// Helper function for queries
 const query = (text, params) => pgPool.query(text, params);
 
-// Optimized Worker Configuration
+// CRITICAL FIX: BullMQ v4 settings structure
 const emailWorker = new Worker(
   "emailQueue",
   async (job) => {
+    // Your existing job processing logic (keep it exactly as is)
     console.log(`📨 Processing job ${job.id}: ${job.name}`);
     
     let duplicates = [];
@@ -47,7 +47,6 @@ const emailWorker = new Worker(
       if (job.name === "sendEmailJob") {
         const { email, subject, body } = job.data;
         
-        // Optimize: Check both databases in parallel
         const [existingMySQL, existingMongoDB] = await Promise.all([
           query("SELECT id, email FROM emails WHERE email = $1", [email]),
           emailCollection.findOne({ email })
@@ -60,7 +59,6 @@ const emailWorker = new Worker(
           duplicates.push(email);
           skippedCount = 1;
           
-          // Use Promise.all for parallel inserts where needed
           const insertPromises = [];
           
           if (existingMySQL.rows.length === 0) {
@@ -102,7 +100,6 @@ const emailWorker = new Worker(
           };
         }
 
-        // No duplicate - insert to both databases in parallel
         const [pgResult, mongoResult] = await Promise.all([
           query(
             "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
@@ -131,15 +128,14 @@ const emailWorker = new Worker(
         };
 
       } else if (job.name === "sendBulkEmailsJob") {
+        // Your existing bulk processing logic (keep as is)
         const emails = job.data.emails;
         const totalEmails = emails.length;
         
         console.log(`📦 Processing bulk job with ${totalEmails} emails`);
 
-        // Extract email addresses
         const emailList = emails.map(e => e.email);
         
-        // Check both databases in parallel
         const [existingPostgreSQL, existingMongoDB] = await Promise.all([
           query(
             "SELECT email FROM emails WHERE email = ANY($1::text[])",
@@ -154,7 +150,6 @@ const emailWorker = new Worker(
         const existingEmailsMongoDB = new Set(existingMongoDB.map(e => e.email));
         const allExistingEmails = new Set([...existingEmailsPostgreSQL, ...existingEmailsMongoDB]);
 
-        // Separate unique and duplicate emails
         const uniqueEmails = emails.filter(emailObj => !allExistingEmails.has(emailObj.email));
         const duplicateEmails = emails.filter(emailObj => allExistingEmails.has(emailObj.email));
         
@@ -163,12 +158,11 @@ const emailWorker = new Worker(
 
         console.log(`📊 Unique: ${uniqueEmails.length}, Duplicates: ${duplicates.length}`);
 
-        // Process inserts in parallel batches
         const batchSize = 100;
         const pgBatches = [];
         const mongoBatches = [];
 
-        // Prepare PostgreSQL batches
+        // PostgreSQL batches
         for (let i = 0; i < uniqueEmails.length; i += batchSize) {
           const batch = uniqueEmails.slice(i, i + batchSize);
           
@@ -190,7 +184,7 @@ const emailWorker = new Worker(
           pgBatches.push(query(batchQuery, values));
         }
 
-        // Prepare MongoDB batches (only emails not in MongoDB)
+        // MongoDB batches (only emails not in MongoDB)
         const emailsForMongoDB = uniqueEmails.filter(emailObj => !existingEmailsMongoDB.has(emailObj.email));
         
         for (let i = 0; i < emailsForMongoDB.length; i += batchSize) {
@@ -220,13 +214,11 @@ const emailWorker = new Worker(
           mongoBatches.push(emailCollection.insertMany(mongoDocs));
         }
 
-        // Execute all batches in parallel
         const [pgResults, mongoResults] = await Promise.all([
           Promise.all(pgBatches),
           Promise.all(mongoBatches)
         ]);
 
-        // Count inserted rows
         const pgInserted = pgResults.reduce((sum, result) => sum + (result.rowCount || 0), 0);
         const mongoInserted = mongoResults.reduce((sum, result) => sum + (result.insertedCount || 0), 0);
         
@@ -250,30 +242,36 @@ const emailWorker = new Worker(
   {
     connection: {
       url: process.env.REDIS_URL,
-      // Add connection options for Upstash
       maxRetriesPerRequest: null,
       enableReadyCheck: false
     },
     concurrency: 5,
-    // OPTIMIZED SETTINGS FOR FREE TIER
-    settings: {
-      markerTTL: 30000,      // Wait 30s between checks (reduces Redis commands by 83%)
-      stalledInterval: 120000, // Check stalled every 2 minutes
-      lockDuration: 60000,    // 1 minute lock duration
-      maxStalledCount: 2      // Only retry stalled jobs twice
-    },
+    // CRITICAL: BullMQ v4 settings - these go at root level, not in 'settings'
+    lockDuration: 60000,        // How long to hold the job lock (default: 30000)
+    stalledInterval: 120000,     // How often to check for stalled jobs (default: 30000)
+    maxStalledCount: 2,          // Max retries for stalled jobs (default: 1)
+    skipStalledCheck: false,     // Don't skip stalled check
+    // This is the key setting for reducing polling - it's called 'drainDelay' in v4, not 'markerTTL'
+    drainDelay: 30000,           // Wait 30 seconds when queue is empty instead of 5 (THIS IS THE FIX!)
+    
     removeOnComplete: {
-      age: 3600, // Remove completed jobs older than 1 hour (reduces Redis memory)
-      count: 100 // Keep only last 100 completed jobs
+      age: 3600,  // 1 hour
+      count: 100
     },
     removeOnFail: {
-      age: 7200, // Remove failed jobs older than 2 hours
-      count: 200 // Keep only last 200 failed jobs
+      age: 7200,  // 2 hours
+      count: 200
+    },
+    
+    // These settings help reduce Redis commands
+    limiter: {
+      max: 100,   // Max jobs processed
+      duration: 1000 // Per second
     }
   }
 );
 
-// Worker event listeners (keep these - they don't affect Redis much)
+// Worker event listeners
 emailWorker.on("completed", (job, result) => {
   console.log(`✅ Job ${job.id} completed successfully`);
   if (result?.type === "bulk") {
@@ -285,26 +283,17 @@ emailWorker.on("failed", (job, err) => {
   console.error(`❌ Job ${job.id} failed: ${err.message}`);
 });
 
-// Only log progress for long-running jobs (optional)
-emailWorker.on("progress", (job, progress) => {
-  if (progress % 50 === 0) { // Log only at 50% and 100%
-    console.log(`📈 Job ${job.id} progress: ${progress}%`);
-  }
-});
-
 emailWorker.on("error", (err) => {
   console.error("Worker error:", err);
 });
 
-// Graceful shutdown - close all connections
+// Graceful shutdown
 async function shutdown() {
   console.log('🛑 Shutting down gracefully...');
   
-  // Close worker first (stops accepting new jobs)
   await emailWorker.close();
   console.log('✅ Worker closed');
   
-  // Close PostgreSQL pool
   await pgPool.end();
   console.log('✅ PostgreSQL pool closed');
   
@@ -315,11 +304,10 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 console.log("✅ Email worker started with Redis-optimized settings");
-console.log("📊 Settings:", {
+console.log("📊 Settings for BullMQ v4:", {
   concurrency: 5,
-  markerTTL: '30s',
-  stalledInterval: '2m',
-  lockDuration: '1m',
-  removeOnComplete: '100 jobs or 1 hour',
-  removeOnFail: '200 jobs or 2 hours'
+  drainDelay: '30s (was 5s)',
+  stalledInterval: '2m (was 30s)',
+  lockDuration: '1m (was 30s)',
+  maxStalledCount: 2
 });
