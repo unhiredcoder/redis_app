@@ -11,7 +11,9 @@ const pgPool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
-  }
+  },
+  max: 10, // Limit connection pool size
+  idleTimeoutMillis: 30000
 });
 
 // Test PostgreSQL connection
@@ -31,6 +33,7 @@ testConnection();
 // Helper function for queries
 const query = (text, params) => pgPool.query(text, params);
 
+// Optimized Worker Configuration
 const emailWorker = new Worker(
   "emailQueue",
   async (job) => {
@@ -44,53 +47,50 @@ const emailWorker = new Worker(
       if (job.name === "sendEmailJob") {
         const { email, subject, body } = job.data;
         
-        // Update job progress
-        await job.updateProgress(10);
+        // Optimize: Check both databases in parallel
+        const [existingMySQL, existingMongoDB] = await Promise.all([
+          query("SELECT id, email FROM emails WHERE email = $1", [email]),
+          emailCollection.findOne({ email })
+        ]);
 
-        // Check PostgreSQL for duplicate
-        const existingMySQL = await query(
-          "SELECT id, email FROM emails WHERE email = $1",
-          [email]
-        );
-        
-        // Update job progress
-        await job.updateProgress(30);
+        const isDuplicate = existingMySQL.rows.length > 0 || existingMongoDB;
 
-        // Check MongoDB for duplicate
-        const existingMongoDB = await emailCollection.findOne({ email });
-        
-        // Update job progress
-        await job.updateProgress(50);
-
-        if (existingMySQL.rows.length > 0 || existingMongoDB) {
+        if (isDuplicate) {
           console.log(`⚠️ Duplicate found: ${email}`);
           duplicates.push(email);
           skippedCount = 1;
           
-          // Insert into the database where it doesn't exist
+          // Use Promise.all for parallel inserts where needed
+          const insertPromises = [];
+          
           if (existingMySQL.rows.length === 0) {
-            // Insert into PostgreSQL
-            const result = await query(
-              "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
-              [email, subject, body]
+            insertPromises.push(
+              query(
+                "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
+                [email, subject, body]
+              ).then(result => {
+                console.log(`📝 Inserted into PostgreSQL: ${result.rows[0].id}`);
+                insertedCount++;
+              })
             );
-            console.log(`📝 Inserted into PostgreSQL: ${result.rows[0].id}`);
-            insertedCount++;
           }
           
           if (!existingMongoDB) {
-            // Insert into MongoDB
-            const mongoResult = await emailCollection.insertOne({
-              email,
-              subject,
-              body,
-              created_at: new Date(),
-            });
-            console.log(`📝 Inserted into MongoDB: ${mongoResult.insertedId}`);
-            insertedCount++;
+            insertPromises.push(
+              emailCollection.insertOne({
+                email,
+                subject,
+                body,
+                created_at: new Date(),
+              }).then(result => {
+                console.log(`📝 Inserted into MongoDB: ${result.insertedId}`);
+                insertedCount++;
+              })
+            );
           }
           
-          await job.updateProgress(100);
+          await Promise.all(insertPromises);
+          
           return {
             success: true,
             type: "single",
@@ -102,27 +102,23 @@ const emailWorker = new Worker(
           };
         }
 
-        // Insert into PostgreSQL (no duplicate)
-        const pgResult = await query(
-          "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
-          [email, subject, body]
-        );
+        // No duplicate - insert to both databases in parallel
+        const [pgResult, mongoResult] = await Promise.all([
+          query(
+            "INSERT INTO emails (email, subject, body, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id",
+            [email, subject, body]
+          ),
+          emailCollection.insertOne({
+            email,
+            subject,
+            body,
+            created_at: new Date(),
+          })
+        ]);
+        
         console.log(`✅ PostgreSQL insert: ${pgResult.rows[0].id}`);
-        insertedCount++;
-        
-        await job.updateProgress(70);
-
-        // Insert into MongoDB
-        const mongoResult = await emailCollection.insertOne({
-          email,
-          subject,
-          body,
-          created_at: new Date(),
-        });
         console.log(`✅ MongoDB insert: ${mongoResult.insertedId}`);
-        insertedCount++;
-        
-        await job.updateProgress(100);
+        insertedCount = 2;
         
         return {
           success: true,
@@ -139,28 +135,20 @@ const emailWorker = new Worker(
         const totalEmails = emails.length;
         
         console.log(`📦 Processing bulk job with ${totalEmails} emails`);
-        
-        // Update progress
-        await job.updateProgress(10);
 
         // Extract email addresses
         const emailList = emails.map(e => e.email);
         
-        // Check PostgreSQL for existing emails
-        // PostgreSQL doesn't support IN with array directly, so we use ANY($1)
-        const existingPostgreSQL = await query(
-          "SELECT email FROM emails WHERE email = ANY($1::text[])",
-          [emailList]
-        );
-        
-        await job.updateProgress(30);
-
-        // Check MongoDB for existing emails
-        const existingMongoDB = await emailCollection.find({
-          email: { $in: emailList }
-        }).toArray();
-        
-        await job.updateProgress(50);
+        // Check both databases in parallel
+        const [existingPostgreSQL, existingMongoDB] = await Promise.all([
+          query(
+            "SELECT email FROM emails WHERE email = ANY($1::text[])",
+            [emailList]
+          ),
+          emailCollection.find({
+            email: { $in: emailList }
+          }).toArray()
+        ]);
 
         const existingEmailsPostgreSQL = new Set(existingPostgreSQL.rows.map(e => e.email));
         const existingEmailsMongoDB = new Set(existingMongoDB.map(e => e.email));
@@ -175,78 +163,74 @@ const emailWorker = new Worker(
 
         console.log(`📊 Unique: ${uniqueEmails.length}, Duplicates: ${duplicates.length}`);
 
-        // Process unique emails for PostgreSQL
-        if (uniqueEmails.length > 0) {
-          // PostgreSQL bulk insert using multiple VALUES rows
-          let insertedRows = 0;
-          
-          // Process in batches to avoid huge queries
-          const batchSize = 100;
-          for (let i = 0; i < uniqueEmails.length; i += batchSize) {
-            const batch = uniqueEmails.slice(i, i + batchSize);
-            
-            // Build parameterized query for batch
-            const values = [];
-            const placeholders = [];
-            
-            batch.forEach((email, index) => {
-              const baseIndex = index * 3;
-              placeholders.push(`($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, NOW())`);
-              values.push(email.email, email.subject, email.body);
-            });
-            
-            const batchQuery = `
-              INSERT INTO emails (email, subject, body, created_at) 
-              VALUES ${placeholders.join(', ')}
-              RETURNING id
-            `;
-            
-            const result = await query(batchQuery, values);
-            insertedRows += result.rowCount;
-            console.log(`✅ PostgreSQL batch insert: ${result.rowCount} rows`);
-          }
-          
-          console.log(`✅ PostgreSQL bulk insert: ${insertedRows} rows total`);
-          insertedCount += insertedRows;
-        }
-        
-        await job.updateProgress(70);
+        // Process inserts in parallel batches
+        const batchSize = 100;
+        const pgBatches = [];
+        const mongoBatches = [];
 
-        // Process unique emails for MongoDB (only those not in MongoDB)
+        // Prepare PostgreSQL batches
+        for (let i = 0; i < uniqueEmails.length; i += batchSize) {
+          const batch = uniqueEmails.slice(i, i + batchSize);
+          
+          const values = [];
+          const placeholders = [];
+          
+          batch.forEach((email, index) => {
+            const baseIndex = index * 3;
+            placeholders.push(`($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, NOW())`);
+            values.push(email.email, email.subject, email.body);
+          });
+          
+          const batchQuery = `
+            INSERT INTO emails (email, subject, body, created_at) 
+            VALUES ${placeholders.join(', ')}
+            RETURNING id
+          `;
+          
+          pgBatches.push(query(batchQuery, values));
+        }
+
+        // Prepare MongoDB batches (only emails not in MongoDB)
         const emailsForMongoDB = uniqueEmails.filter(emailObj => !existingEmailsMongoDB.has(emailObj.email));
         
-        if (emailsForMongoDB.length > 0) {
-          const mongoDocs = emailsForMongoDB.map(email => ({
+        for (let i = 0; i < emailsForMongoDB.length; i += batchSize) {
+          const batch = emailsForMongoDB.slice(i, i + batchSize);
+          const mongoDocs = batch.map(email => ({
             email: email.email,
             subject: email.subject,
             body: email.body,
             created_at: new Date(),
           }));
-          
-          const mongoResult = await emailCollection.insertMany(mongoDocs);
-          console.log(`✅ MongoDB bulk insert: ${mongoResult.insertedCount} documents`);
-          insertedCount += mongoResult.insertedCount;
+          mongoBatches.push(emailCollection.insertMany(mongoDocs));
         }
 
-        // Handle emails that exist only in PostgreSQL (add to MongoDB)
+        // Handle emails that exist only in PostgreSQL
         const emailsOnlyInPostgreSQL = duplicateEmails.filter(emailObj => 
           existingEmailsPostgreSQL.has(emailObj.email) && !existingEmailsMongoDB.has(emailObj.email)
         );
-        
-        if (emailsOnlyInPostgreSQL.length > 0) {
-          const mongoDocs = emailsOnlyInPostgreSQL.map(email => ({
+
+        for (let i = 0; i < emailsOnlyInPostgreSQL.length; i += batchSize) {
+          const batch = emailsOnlyInPostgreSQL.slice(i, i + batchSize);
+          const mongoDocs = batch.map(email => ({
             email: email.email,
             subject: email.subject,
             body: email.body,
             created_at: new Date(),
           }));
-          
-          const mongoResult = await emailCollection.insertMany(mongoDocs);
-          console.log(`📝 Added ${mongoResult.insertedCount} emails to MongoDB (existed only in PostgreSQL)`);
-          insertedCount += mongoResult.insertedCount;
+          mongoBatches.push(emailCollection.insertMany(mongoDocs));
         }
+
+        // Execute all batches in parallel
+        const [pgResults, mongoResults] = await Promise.all([
+          Promise.all(pgBatches),
+          Promise.all(mongoBatches)
+        ]);
+
+        // Count inserted rows
+        const pgInserted = pgResults.reduce((sum, result) => sum + (result.rowCount || 0), 0);
+        const mongoInserted = mongoResults.reduce((sum, result) => sum + (result.insertedCount || 0), 0);
         
-        await job.updateProgress(100);
+        insertedCount = pgInserted + mongoInserted;
 
         return {
           success: true,
@@ -265,47 +249,77 @@ const emailWorker = new Worker(
   },
   {
     connection: {
-        url: process.env.REDIS_URL
+      url: process.env.REDIS_URL,
+      // Add connection options for Upstash
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false
     },
     concurrency: 5,
+    // OPTIMIZED SETTINGS FOR FREE TIER
+    settings: {
+      markerTTL: 30000,      // Wait 30s between checks (reduces Redis commands by 83%)
+      stalledInterval: 120000, // Check stalled every 2 minutes
+      lockDuration: 60000,    // 1 minute lock duration
+      maxStalledCount: 2      // Only retry stalled jobs twice
+    },
     removeOnComplete: {
-      count: 1000, 
+      age: 3600, // Remove completed jobs older than 1 hour (reduces Redis memory)
+      count: 100 // Keep only last 100 completed jobs
     },
     removeOnFail: {
-      count: 5000, 
+      age: 7200, // Remove failed jobs older than 2 hours
+      count: 200 // Keep only last 200 failed jobs
     }
   }
 );
 
-// Worker event listeners
+// Worker event listeners (keep these - they don't affect Redis much)
 emailWorker.on("completed", (job, result) => {
   console.log(`✅ Job ${job.id} completed successfully`);
-  console.log("Result:", JSON.stringify(result, null, 2));
+  if (result?.type === "bulk") {
+    console.log(`📊 Bulk result: ${result.insertedCount} inserted, ${result.skippedCount} skipped`);
+  }
 });
 
 emailWorker.on("failed", (job, err) => {
   console.error(`❌ Job ${job.id} failed: ${err.message}`);
 });
 
+// Only log progress for long-running jobs (optional)
 emailWorker.on("progress", (job, progress) => {
-  console.log(`📈 Job ${job.id} progress: ${progress}%`);
+  if (progress % 50 === 0) { // Log only at 50% and 100%
+    console.log(`📈 Job ${job.id} progress: ${progress}%`);
+  }
 });
 
 emailWorker.on("error", (err) => {
   console.error("Worker error:", err);
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Received SIGINT. Closing PostgreSQL pool...');
+// Graceful shutdown - close all connections
+async function shutdown() {
+  console.log('🛑 Shutting down gracefully...');
+  
+  // Close worker first (stops accepting new jobs)
+  await emailWorker.close();
+  console.log('✅ Worker closed');
+  
+  // Close PostgreSQL pool
   await pgPool.end();
+  console.log('✅ PostgreSQL pool closed');
+  
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM. Closing PostgreSQL pool...');
-  await pgPool.end();
-  process.exit(0);
-});
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
-console.log("✅ Email worker started and waiting for jobs...");
+console.log("✅ Email worker started with Redis-optimized settings");
+console.log("📊 Settings:", {
+  concurrency: 5,
+  markerTTL: '30s',
+  stalledInterval: '2m',
+  lockDuration: '1m',
+  removeOnComplete: '100 jobs or 1 hour',
+  removeOnFail: '200 jobs or 2 hours'
+});
